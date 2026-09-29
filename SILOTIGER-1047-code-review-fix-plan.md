@@ -154,6 +154,10 @@ behavior-preserving cleanup. It does not authorize a kernel rewrite.
   next kernel edit. A phase checkbox stays open until its new `test_*`
   fails on the unfixed tree (or is a static check that cannot run on
   gfx950) and passes after the fix.
+- **Added tests check behavior.** A new `test_*` must show the kernel
+  or wrapper doing the wrong thing before the fix and the right thing
+  after, by what it returns, raises, or launches. Reading source text,
+  signatures, or bytecode is not that test.
 - **gfx950 is the device we have.** GPU 6 proves the gfx950 numerics and
   the bar timings. The gfx942 LDS miss is a static shared-memory size
   plus a dispatch decision. Do not claim a gfx942 run from a gfx950 box.
