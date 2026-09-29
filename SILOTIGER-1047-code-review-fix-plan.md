@@ -40,7 +40,7 @@ under the relevant phase as evidence.
 - [x] 4. Score-matrix scope, benches, and stronger K1 assertions
 - [x] 5. Behavior-preserving kernel cleanup
 - [x] 6. QSA AOT registration
-- [ ] 7. Optional: caller-owned K2 split workspace, only if a profile says so
+- [x] 7. Optional: caller-owned K2 split workspace, only if a profile says so
 
 ## Locked decisions
 
@@ -505,7 +505,19 @@ prefill bar does not split.
       launch is 11.3–11.5 µs and 14.8–15.1 µs. Prefill wall time
       matches that launch (246.7 µs against 246.3 µs). A CUDA event
       around the same empties is 1.5 µs above its 4.4 µs floor.
-- [ ] **7b.** If it is visible, accept a caller-owned workspace and
+- [x] **7b.** If it is visible, accept a caller-owned workspace and
       keep the current allocation as the default when the caller
       passes none. Re-time the bar shapes. The default path must not
       get a second buffer.
+      `workspace` is `(partial_out, partial_lse)`. `None` still
+      allocates that pair on a split launch. One split still stores
+      into `out` and does not read `workspace`.
+      `test_k2_caller_workspace_is_the_only_partial_buffer` failed
+      unfixed with `qsa_k2 does not accept a caller-owned split
+      workspace` and passes after. The workspace launch matches the
+      default launch, the caller's `partial_out` is written, and the
+      peak of that launch stays under one partial buffer. The default
+      launch's peak is one buffer, not two.
+      Default-path bars on GPU 6, cold cache, control immediately
+      before: M=1 L=32768 11.99 → 12.17 µs, M=8 18.63 → 18.61 µs,
+      M=512 L=8192 261.74 → 261.65 µs. Flat.
