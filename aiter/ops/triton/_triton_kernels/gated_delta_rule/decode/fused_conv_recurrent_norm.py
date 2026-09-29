@@ -72,6 +72,7 @@ def fused_conv_recurrent_norm_kernel(
     stride_ssm_slot,
     stride_indices_seq,
     stride_indices_tok,
+    stride_cidx,  # per-sequence stride of conv_state_indices
 ):
     i_n = tl.program_id(0)
     i_h = tl.program_id(1)
@@ -88,6 +89,7 @@ def fused_conv_recurrent_norm_kernel(
     tl.assume(stride_og_tok > 0)
     tl.assume(stride_ssm_slot > 0)
     tl.assume(stride_indices_seq > 0)
+    tl.assume(stride_cidx > 0)
     tl.assume(stride_indices_tok > 0)
 
     bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int64)
@@ -109,7 +111,9 @@ def fused_conv_recurrent_norm_kernel(
             + i_n * stride_indices_seq
             + checkpoint * stride_indices_tok
         ).to(tl.int64)
-        conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
+        conv_state_idx = tl.load(conv_state_indices_ptr + i_n * stride_cidx).to(
+            tl.int64
+        )
         # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID for speculative
         # decode; padded rows point at it.
         if state_idx <= 0 or conv_state_idx <= 0:
@@ -164,13 +168,21 @@ def fused_conv_recurrent_norm_kernel(
         v_h0 = tl.load(p_csv + checkpoint * stride_cs_pos).to(tl.float32)
         v_h1 = tl.load(p_csv + (checkpoint + 1) * stride_cs_pos).to(tl.float32)
         v_h2 = tl.load(p_csv + (checkpoint + 2) * stride_cs_pos).to(tl.float32)
+        # Only commit the rolled-back history if a token will be committed on
+        # top of it. Assumes NULL slots form a suffix, as vLLM produces: a NULL
+        # at token 0 means the whole row is padding. The register copies above
+        # are kept either way; the convolution reads them.
+        first_state_idx = tl.load(ssm_state_indices_ptr + i_n * stride_indices_seq).to(
+            tl.int64
+        )
         tl.debug_barrier()
-        tl.store(p_csq, q_h1.to(p_csq.dtype.element_ty))
-        tl.store(p_csq + stride_cs_pos, q_h2.to(p_csq.dtype.element_ty))
-        tl.store(p_csk, k_h1.to(p_csk.dtype.element_ty))
-        tl.store(p_csk + stride_cs_pos, k_h2.to(p_csk.dtype.element_ty))
-        tl.store(p_csv, v_h1.to(p_csv.dtype.element_ty))
-        tl.store(p_csv + stride_cs_pos, v_h2.to(p_csv.dtype.element_ty))
+        if first_state_idx > 0:
+            tl.store(p_csq, q_h1.to(p_csq.dtype.element_ty))
+            tl.store(p_csq + stride_cs_pos, q_h2.to(p_csq.dtype.element_ty))
+            tl.store(p_csk, k_h1.to(p_csk.dtype.element_ty))
+            tl.store(p_csk + stride_cs_pos, k_h2.to(p_csk.dtype.element_ty))
+            tl.store(p_csv, v_h1.to(p_csv.dtype.element_ty))
+            tl.store(p_csv + stride_cs_pos, v_h2.to(p_csv.dtype.element_ty))
 
     b_A = tl.load(A_log_ptr + i_h).to(tl.float32)
 
@@ -432,6 +444,7 @@ def fused_kda_spec_parallel_v_kernel(
     stride_ssm_slot,
     stride_indices_seq,
     stride_indices_tok,
+    stride_cidx,  # per-sequence stride of conv_state_indices
 ):
     """Run the speculative recurrence in parallel V tiles.
 
@@ -456,6 +469,7 @@ def fused_kda_spec_parallel_v_kernel(
     tl.assume(stride_beta_tok > 0)
     tl.assume(stride_ssm_slot > 0)
     tl.assume(stride_indices_seq > 0)
+    tl.assume(stride_cidx > 0)
     tl.assume(stride_indices_tok > 0)
     bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int64)
     eos = tl.load(cu_seqlens_ptr + i_n + 1).to(tl.int64)
@@ -470,7 +484,7 @@ def fused_kda_spec_parallel_v_kernel(
         + i_n * stride_indices_seq
         + checkpoint * stride_indices_tok
     ).to(tl.int64)
-    conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
+    conv_state_idx = tl.load(conv_state_indices_ptr + i_n * stride_cidx).to(tl.int64)
     # vLLM reserves physical cache slot 0 as NULL_BLOCK_ID.
     if read_state_idx <= 0 or conv_state_idx <= 0:
         return
@@ -633,6 +647,7 @@ def fused_kda_spec_finalize_kernel(
     stride_og_tok: tl.constexpr,
     stride_indices_seq,
     stride_indices_tok,
+    stride_cidx,  # per-sequence stride of conv_state_indices
 ):
     """Normalize tiled output and commit speculative convolution state once.
 
@@ -648,6 +663,7 @@ def fused_kda_spec_finalize_kernel(
     tl.assume(stride_cs_dim > 0)
     tl.assume(stride_cs_pos > 0)
     tl.assume(stride_og_tok > 0)
+    tl.assume(stride_cidx > 0)
     bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int64)
     eos = tl.load(cu_seqlens_ptr + i_n + 1).to(tl.int64)
     seq_t = eos - bos
@@ -662,7 +678,7 @@ def fused_kda_spec_finalize_kernel(
         + i_n * stride_indices_seq
         + checkpoint * stride_indices_tok
     ).to(tl.int64)
-    conv_state_idx = tl.load(conv_state_indices_ptr + i_n).to(tl.int64)
+    conv_state_idx = tl.load(conv_state_indices_ptr + i_n * stride_cidx).to(tl.int64)
     if read_state_idx <= 0 or conv_state_idx <= 0:
         return
     tl.assume(conv_state_idx > 0)
@@ -676,6 +692,15 @@ def fused_kda_spec_finalize_kernel(
     p_csq = p_cs + (q_off + o_k) * stride_cs_dim
     p_csk = p_cs + (k_off + o_k) * stride_cs_dim
     p_csv = p_cs + (v_off + o_v) * stride_cs_dim
+
+    # The accepted-checkpoint check above does not cover a later NULL token.
+    # Must precede the i_t == 0 rollback: committing it for a token that is then
+    # skipped leaves the cache half-updated.
+    token_state_idx = tl.load(
+        ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
+    ).to(tl.int64)
+    if token_state_idx <= 0:
+        return
 
     if i_t == 0:
         carry_base = i_n * (3 * lp * 2)
@@ -692,14 +717,6 @@ def fused_kda_spec_finalize_kernel(
         tl.store(p_csk + stride_cs_pos, k_h2)
         tl.store(p_csv, v_h1)
         tl.store(p_csv + stride_cs_pos, v_h2)
-
-    # The accepted-checkpoint check above does not cover a later NULL token.
-    # Slot 0 must not receive a conv-state write or a normalized output.
-    token_state_idx = tl.load(
-        ssm_state_indices_ptr + i_n * stride_indices_seq + i_t * stride_indices_tok
-    ).to(tl.int64)
-    if token_state_idx <= 0:
-        return
 
     tok = bos + i_t
     p_x = x_ptr + tok * stride_x_tok

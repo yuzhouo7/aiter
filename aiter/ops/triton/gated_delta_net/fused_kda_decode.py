@@ -18,10 +18,10 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_conv_recurre
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
-# Measured on gfx950 (the only arch that launches these kernels). The published
-# JSON is the tile; this fallback is what the loader returns when that file is
-# absent.
-_SPEC_KERNEL_FALLBACK = triton.Config({}, num_warps=2)
+# Launch params only. The BV tile comes from
+# configs/<arch>/triton/attention/fused_kda_decode/DEFAULT.json; without it the
+# speculative path is not taken at all (see the dispatch below).
+_SPEC_KERNEL_FALLBACK = triton.Config({}, num_warps=2, num_stages=2)
 
 
 def fused_kda_decode(
@@ -74,7 +74,8 @@ def fused_kda_decode(
         num_local_heads: int, H = num_local_heads.
         lower_bound: float, KDA gate lower bound (typically -5.0).
         num_accepted_tokens: [B] int32 accepted-token counts for spec decode.
-        conv_state_indices: [B] int32 convolution-cache slots for spec decode.
+        conv_state_indices: [B] int32 convolution-cache slots for spec decode,
+            may be strided (vLLM passes ssm_state_indices[:, 0]).
         out: Optional preallocated contiguous [T, H*K] bf16 output.
 
     Returns:
@@ -92,11 +93,38 @@ def fused_kda_decode(
             raise ValueError(
                 "Spec decode requires 2-D ssm_state_indices and conv_state_indices"
             )
+        for name, vec in (
+            ("num_accepted_tokens", num_accepted_tokens),
+            ("conv_state_indices", conv_state_indices),
+        ):
+            if vec.ndim != 1:
+                raise ValueError(f"{name} must be 1-D, got shape {tuple(vec.shape)}")
+        # No length check: a padded caller passes these at different lengths,
+        # and the kernels drop padded rows at their seq_T == 0 return before
+        # reading either. conv_state_indices carries a stride because the
+        # natural caller slices it as ssm_state_indices[:, 0], stride S not 1.
+        stride_cidx = conv_state_indices.stride(0)
+        # Stride 0 (an expanded tensor) would give every sequence the first
+        # sequence's conv slot, so they would all share one live cache entry.
+        if batch > 1 and stride_cidx <= 0:
+            raise ValueError(
+                f"conv_state_indices must have a positive stride, got "
+                f"{stride_cidx} (an expanded or broadcast tensor?)"
+            )
+        # num_accepted_tokens is read packed, so a strided one would silently
+        # pick up the wrong sequence rather than fail.
+        if batch > 1 and num_accepted_tokens.stride(0) != 1:
+            raise ValueError(
+                f"num_accepted_tokens must be contiguous, got stride "
+                f"{num_accepted_tokens.stride(0)}"
+            )
         stride_indices_seq = ssm_state_indices.stride(0)
         stride_indices_tok = ssm_state_indices.stride(1)
     else:
         stride_indices_seq = ssm_state_indices.stride(0)
         stride_indices_tok = 1
+        # Unused off the speculative path; the pointers alias ssm_state_indices.
+        stride_cidx = 1
     num_accepted_tokens_arg = (
         num_accepted_tokens if num_accepted_tokens is not None else ssm_state_indices
     )
@@ -134,20 +162,50 @@ def fused_kda_decode(
     stride_beta_tok = beta.stride(1) if beta.dim() == 3 else beta.stride(0)
     stride_og_tok = out_gate.stride(0)
 
-    block_v = 16
     # Tokens per speculative sequence: num_speculative_tokens + 1. H and this
     # width are not specialized: the parallel kernel indexes heads from
     # program_id(1) and clamps its token loop to SPEC_LEN.
     spec_tokens = ssm_state_indices.shape[1] if is_spec_decoding else 0
+    # BV is a compile-time tile, so resolve it before the V % BV test below.
+    parallel_cfg = None
+    block_v = 0
+    if is_spec_decoding and get_arch() == "gfx950":
+        cfg = get_tuned_kernel_config(
+            "attention",
+            "FUSED_KDA_DECODE",
+            "fused_kda_spec_parallel_v_kernel",
+            _SPEC_KERNEL_FALLBACK,
+        )
+        # An unpublished tile drops to the generic kernel rather than raising.
+        bv = cfg.kwargs.get("BV")
+        if bv is not None:
+            # tl.arange needs a power of two.
+            if not isinstance(bv, int) or bv <= 0 or bv & (bv - 1):
+                raise ValueError(
+                    f"BV must be a positive power of two, got {bv!r} in the "
+                    "fused_kda_decode config"
+                )
+            parallel_cfg = cfg
+            block_v = bv
     # W == 4 is structural: the recurrence keeps exactly W - 1 = 3 conv history
     # taps in registers.
     use_parallel_spec = (
-        is_spec_decoding
-        and get_arch() == "gfx950"
+        parallel_cfg is not None
         and K == 128
         and V % block_v == 0
         and W == 4
-        and spec_tokens >= 2
+        # Speedup over the generic kernel, gfx950 Hloc=12 D=128, median of 5.
+        # batch is cu_seqlens.shape[0] - 1, so under full CUDA graphs it is the
+        # capture size, not the live sequence count.
+        #
+        #  spec_tokens   b1    b2    b4    b8   b16   b24   b32   b48
+        #      2        0.77  0.75  0.78  0.94  1.18  1.14  1.06  1.41
+        #      3        1.03  1.03  1.11  1.31  1.29  1.20  1.12  1.40
+        #      4        1.23  1.28  1.39  1.65  1.41  1.36  1.19  1.54
+        #      8        2.24  2.46  2.32  1.93  1.70  1.56  1.31  1.62
+        #
+        # Width 2 is the only loser: too few tokens to be worth splitting.
+        and (spec_tokens >= 3 or batch >= 16)
         # The recurrence reads conv history at checkpoint + W - 2 and finalize
         # writes it at W - 2 + i_t, both with an index up to spec_tokens + 1.
         and conv_state.shape[2] >= spec_tokens + W - 2
@@ -157,12 +215,6 @@ def fused_kda_decode(
         # graph capture. Both kernels clamp each sequence to SPEC_LEN, so a
         # packed batch with a short sequence still takes this path, and a span
         # longer than the index row drops the surplus tokens.
-        parallel_cfg = get_tuned_kernel_config(
-            "attention",
-            "FUSED_KDA_DECODE",
-            "fused_kda_spec_parallel_v_kernel",
-            _SPEC_KERNEL_FALLBACK,
-        )
         finalize_cfg = get_tuned_kernel_config(
             "attention",
             "FUSED_KDA_DECODE",
@@ -210,7 +262,9 @@ def fused_kda_decode(
             stride_ssm_slot=ssm_state.stride(0),
             stride_indices_seq=stride_indices_seq,
             stride_indices_tok=stride_indices_tok,
+            stride_cidx=stride_cidx,
             num_warps=parallel_cfg.num_warps,
+            num_stages=parallel_cfg.num_stages,
         )
         fused_kda_spec_finalize_kernel[(batch, H, spec_tokens)](
             mixed_qkv,
@@ -236,7 +290,9 @@ def fused_kda_decode(
             stride_og_tok=stride_og_tok,
             stride_indices_seq=stride_indices_seq,
             stride_indices_tok=stride_indices_tok,
+            stride_cidx=stride_cidx,
             num_warps=finalize_cfg.num_warps,
+            num_stages=finalize_cfg.num_stages,
         )
         return out
 
@@ -280,6 +336,7 @@ def fused_kda_decode(
         stride_ssm_slot=ssm_state.stride(0),
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_cidx=stride_cidx,
         num_warps=2 if get_arch() in ("gfx942", "gfx950") else 4,
     )
     return out

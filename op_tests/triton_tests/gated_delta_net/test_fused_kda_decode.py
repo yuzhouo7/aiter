@@ -631,7 +631,10 @@ def test_fused_normal_decode_multi_token():
         (1, 12, 7),
         (2, 12, 7),
         (4, 12, 3),
-        (2, 4, 1),
+        # num_spec 2 (spec_tokens 3) is the smallest that dispatches regardless
+        # of batch. num_spec 1 goes to the generic kernel below batch 16 on
+        # purpose; the batch-dependent dispatch test below covers that.
+        (2, 4, 3),
         (1, 12, 15),
     ],
 )
@@ -813,21 +816,49 @@ def test_optimized_fused_spec_decode_skips_vllm_null_block():
     torch.testing.assert_close(inp["state"], before_ss, atol=0, rtol=0)
 
 
-def test_spec_decode_null_token_does_not_write_output():
+# num_spec 7 dispatches to the parallel kernels, 1 stays on the generic kernel
+# at this batch. Each path guards the rollback in a different place: the
+# parallel path in finalize, the generic path in the kernel itself.
+@pytest.mark.parametrize("num_spec", [7, 1])
+@pytest.mark.parametrize("null_pos", ["last", "first"])
+def test_spec_decode_null_token_does_not_write_output(null_pos, num_spec):
     """A live sequence with one slot-0 token must leave that output row and
     physical slot 0 untouched. The accepted checkpoint stays valid, so the
-    sequence-level NULL return does not cover this token."""
-    inp = _make_spec_inputs(1, 2, num_spec=7, full_spec_sequence=True)
-    null_tok = inp["state_indices"].shape[1] - 1
+    sequence-level NULL return does not cover this token.
+
+    "last" is the shape vLLM produces: NULL slots are the padded tail of an
+    index row.
+
+    "first" is not: it needs conv_state_indices passed independently rather
+    than as ssm_state_indices[:, 0], since with that slice a NULL first token
+    zeroes conv_state_idx and the sequence returns earlier. It pins one narrow
+    property for such a caller, that a skipped token does not drag the rollback
+    in with it. The resulting cache is not coherent either way, token 0's own
+    position is never written."""
+    inp = _make_spec_inputs(1, 2, num_spec=num_spec, full_spec_sequence=True)
+    if null_pos == "last":
+        null_tok = inp["state_indices"].shape[1] - 1
+    else:
+        null_tok = 0
+        inp["num_accepted_tokens"][0] = 2
     inp["state_indices"][0, null_tok] = 0
+    cidx = int(inp["conv_state_indices"][0].item())
     before_slot0 = inp["state"][0].clone()
-    out = torch.zeros(8, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
+    before_rollback = inp["conv_state"][cidx, :, :2].clone()
+    out = torch.zeros(num_spec + 1, 2 * SPEC_D, dtype=torch.bfloat16, device=device)
     _run_spec(inp, out=out)
     torch.testing.assert_close(
         out[null_tok], torch.zeros_like(out[null_tok]), atol=0, rtol=0
     )
     torch.testing.assert_close(inp["state"][0], before_slot0, atol=0, rtol=0)
-    assert out[:null_tok].abs().max().item() > 0
+    if null_pos == "last":
+        assert out[:null_tok].abs().max().item() > 0
+    else:
+        # The skipped token must not have dragged the rollback in with it.
+        torch.testing.assert_close(
+            inp["conv_state"][cidx, :, :2], before_rollback, atol=0, rtol=0
+        )
+        assert out[null_tok + 1 :].abs().max().item() > 0
 
 
 def _run_spec(inp, conv_weight=None, out=None):
@@ -945,6 +976,56 @@ def test_spec_decode_shorter_packed_sequence_stays_specialized():
     spec_tokens = inp["state_indices"].shape[1]
     assert inp["mixed_qkv"].shape[0] < 2 * spec_tokens
     _assert_spec_matches(inp, expect_parallel=get_arch() == "gfx950")
+
+
+@pytest.mark.parametrize(
+    "num_spec,batch,expect_parallel",
+    [
+        # spec_tokens 2 is the one losing width: 0.77x at batch 1 and 0.94x at
+        # batch 8, turning to 1.18x only at batch 16. The batch 8 row stops the
+        # threshold dropping to 8 or below; nothing here pins it at exactly 16.
+        (1, 2, False),
+        (1, 8, False),
+        (1, 16, True),
+        # spec_tokens 3 pays at every batch (1.03x at batch 1, 1.31x at 8), so
+        # it must dispatch even at a small batch. This row holds the width
+        # threshold at 3 rather than 4.
+        (2, 2, True),
+    ],
+)
+def test_spec_dispatch_gate(num_spec, batch, expect_parallel):
+    """Both gate thresholds are load-bearing, so both are pinned here.
+    Either path has to match the reference."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    inp = _make_spec_inputs(batch, 2, num_spec=num_spec, full_spec_sequence=True)
+    _assert_spec_matches(
+        inp, expect_parallel=expect_parallel and get_arch() == "gfx950"
+    )
+
+
+# The last row stays on the generic kernel, which reads the same index vector.
+@pytest.mark.parametrize(
+    "batch,num_spec,expect_parallel", [(4, 7, True), (2, 3, True), (2, 1, False)]
+)
+def test_spec_decode_honours_non_contiguous_index_strides(
+    batch, num_spec, expect_parallel
+):
+    """A sliced conv_state_indices must select the same slots as a packed one.
+
+    vLLM builds it as ssm_state_indices[:, 0], a column of the [B, S] index
+    tensor, so its stride is S rather than 1 at every batch above one. Reading
+    it as packed silently picks up another sequence's cache slot; the bug hides
+    at batch 1, where a one-element slice is contiguous."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    inp = _make_spec_inputs(batch, 2, num_spec=num_spec, full_spec_sequence=True)
+    sliced = inp["state_indices"][:, 0]
+    assert not sliced.is_contiguous(), "test would be vacuous on a packed slice"
+    inp["conv_state_indices"] = sliced
+    _assert_spec_matches(
+        inp, expect_parallel=expect_parallel and get_arch() == "gfx950"
+    )
 
 
 def test_spec_decode_narrow_conv_cache_uses_generic_kernel():

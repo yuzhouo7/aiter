@@ -159,18 +159,52 @@ def _make_spec_inputs(batch, Hloc, num_spec):
     }
 
 
+def _count_parallel_launches(fkd_module, fn):
+    """How many times one call launches the parallel-V kernel.
+
+    Observing the launch keeps this benchmark honest about which path the
+    dispatch gate chose, without restating the gate's conditions here.
+    """
+    real = fkd_module.fused_kda_spec_parallel_v_kernel
+    calls = []
+
+    class _Spy:
+        def __getitem__(self, grid):
+            inner = real[grid]
+
+            def launch(*a, **k):
+                calls.append(1)
+                return inner(*a, **k)
+
+            return launch
+
+    fkd_module.fused_kda_spec_parallel_v_kernel = _Spy()
+    try:
+        fn()
+    finally:
+        fkd_module.fused_kda_spec_parallel_v_kernel = real
+    return len(calls)
+
+
 def run_spec_benchmark(args):
     Hloc, num_spec = args.Hloc, args.num_spec
     print(f"\nSpeculative decode: Hloc={Hloc}, D={D}, W={W}, tokens/seq={num_spec + 1}")
-    header = f"{'Batch':>6}  {'Fused spec(us)':>15}"
+    header = (
+        f"{'Batch':>6}  {'Generic(us)':>12}  {'Selected(us)':>13}  "
+        f"{'Speedup':>8}  {'Kernel':>10}"
+    )
     print(header)
     print("-" * len(header))
     for batch in args.batches:
         inp = _make_spec_inputs(batch, Hloc, num_spec)
+        # Clone once, outside the timed region: per-iteration clones bill the
+        # kernel for bookkeeping serving never does, growing with batch (15% of
+        # the reported number at batch 1, 57% at batch 64). State drifts across
+        # iterations as a result; no branch reads a state value.
+        cs = inp["conv_state"].clone()
+        ss = inp["ssm_state"].clone()
 
-        def fn_fused(inp=inp):
-            cs = inp["conv_state"].clone()
-            ss = inp["ssm_state"].clone()
+        def fn_fused(inp=inp, cs=cs, ss=ss):
             fused_kda_decode(
                 inp["mixed_qkv"],
                 cs,
@@ -192,8 +226,32 @@ def run_spec_benchmark(args):
                 conv_state_indices=inp["conv_state_indices"],
             )
 
+        # Time the generic kernel on the same inputs by failing the dispatch
+        # gate's arch test, so the speedup is reproducible rather than taken on
+        # trust. Which kernel the gate picks is observed, not recomputed: the
+        # gate has several other conditions (tile config, K, V, conv width) and
+        # a copy of it here would drift out of date silently.
+        import aiter.ops.triton.gated_delta_net.fused_kda_decode as _fkd
+
+        real_arch = _fkd.get_arch
+        try:
+            _fkd.get_arch = lambda: "gfx942"
+            t_generic = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
+        finally:
+            _fkd.get_arch = real_arch
+
+        launched = _count_parallel_launches(_fkd, fn_fused)
         t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
-        print(f"{batch:>6}  {t_fused:>15.1f}")
+
+        picked = "parallel" if launched else "generic"
+        # A "generic" row timed the same kernel twice, so its ratio would be
+        # 1.00x by construction. Print "-" so it cannot be read as a measured
+        # tie between the two paths.
+        ratio = f"{t_generic / t_fused:>7.2f}x" if launched else f"{'-':>8}"
+        print(
+            f"{batch:>6}  {t_generic:>12.1f}  {t_fused:>13.1f}  "
+            f"{ratio}  {picked:>10}"
+        )
 
 
 def run_benchmark(args):
@@ -210,10 +268,14 @@ def run_benchmark(args):
 
     for batch in batches:
         inp = _make_inputs(batch, Hloc)
+        # Clone once per arm, outside the timed region; see run_spec_benchmark.
+        # Charging both arms does not cancel out, it drags the ratio toward 1.0.
+        cs_3k = inp["conv_state"].clone()
+        ss_3k = inp["ssm_state"].clone()
+        cs_f = inp["conv_state"].clone()
+        ss_f = inp["ssm_state"].clone()
 
-        def fn_3k(inp=inp):
-            cs = inp["conv_state"].clone()
-            ss = inp["ssm_state"].clone()
+        def fn_3k(inp=inp, cs=cs_3k, ss=ss_3k):
             T = inp["mixed_qkv"].shape[0]
             lp = Hloc * D
             q, k, v = causal_conv1d_update_split_qkv(
@@ -246,9 +308,7 @@ def run_benchmark(args):
             og3d = rearrange(inp["out_gate"][:T], "t (h d) -> t h d", d=D)
             rmsnorm_gated_bf16(out, inp["norm_weight"], og3d, 1e-6)
 
-        def fn_fused(inp=inp):
-            cs = inp["conv_state"].clone()
-            ss = inp["ssm_state"].clone()
+        def fn_fused(inp=inp, cs=cs_f, ss=ss_f):
             fused_kda_decode(
                 inp["mixed_qkv"],
                 cs,
