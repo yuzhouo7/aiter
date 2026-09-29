@@ -487,12 +487,24 @@ configs"; use `default_jobs()`, the same pattern as `mega_moe.py`.
 "Consider" in the review. Not required to close the review.
 
 `qsa_k2` allocates fp32 partials on every split launch (`k2.py`
-~1249). At family A, `M=128` and 8 splits, that is about 24 MiB. It
-was not measured.
+around the `n_splits == 1` branch). At family A, `M=128` and 8
+splits, that is about 24 MiB. The bar shapes are smaller, and the
+prefill bar does not split.
 
-- [ ] **7a.** Profile the bar shapes. If the allocation is not visible
-      against the kernel, check this box with the profile note and
-      do not change the API.
+- [x] **7a.** Profile the bar shapes. The allocation is visible on the
+      decode bars, so the API is unchanged here and 7b is the
+      follow-up.
+      GPU 6, family A, caller-supplied `out`, cold cache. M=1 at
+      L=32768 uses 128 splits (3.01 MiB fp32). M=8 uses 32 splits
+      (6.02 MiB). M=512 at L=8192 uses 1 split and allocates nothing.
+      The GPU trace is the kernel only: 12.07 µs, 16.48 µs, and
+      254.83 µs. `torch.empty` launches no kernel.
+      Wall clock of the two empties, allocator already warm
+      (`memory_reserved` unchanged), against a 0.11 µs empty call:
+      3.16–3.25 µs at M=1 and 3.25–3.37 µs at M=8. The kernel-only
+      launch is 11.3–11.5 µs and 14.8–15.1 µs. Prefill wall time
+      matches that launch (246.7 µs against 246.3 µs). A CUDA event
+      around the same empties is 1.5 µs above its 4.4 µs floor.
 - [ ] **7b.** If it is visible, accept a caller-owned workspace and
       keep the current allocation as the default when the caller
       passes none. Re-time the bar shapes. The default path must not
