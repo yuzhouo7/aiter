@@ -462,12 +462,17 @@ comment-only, re-time the touched kernel and revert on a loss.
 and FMHA. The collector does not treat a `[None]` job list as "no
 configs"; use `default_jobs()`, the same pattern as `mega_moe.py`.
 
-- [ ] **6a.** Add a QSA `OpKind` and a collector that returns
-      `default_jobs()` for the shapes this campaign already compiles
-      (family A K1 emit + long-row scorer, family A K2 bar launch).
-      Do not register every bench shape. The JIT wrappers stay the
-      runtime path; AOT must not add a lookup to `qsa_k1_block_ids`
-      or `qsa_k2`.
+- [x] **6a.** Add a QSA `OpKind` and a collector that returns
+      `default_jobs()` for the family A launches this campaign already
+      compiles: page-16 K1 emit, the M=1 long-row scorer (M=8 decode
+      shares it), the M=512 prefill scorer, and the three K2 bar
+      launches. Family B, H=8, and the other sweep values are not
+      registered. `qsa_k1_block_ids` and `qsa_k2` are unchanged; the
+      collector is imported only from the AOT driver.
+      `test_qsa_aot_collector_lists_family_a_launches` failed on the
+      unfixed collector with `QSA is not an AOT kind` and passes after.
+      It checks the job list the collector returns. No kernel change,
+      so the bar shapes were not re-timed.
 - [ ] **6b.** A collector unit check: an empty config list is an empty
       job list, not a `[None]` sentinel. No GPU required.
 
