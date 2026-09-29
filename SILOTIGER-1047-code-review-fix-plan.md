@@ -38,7 +38,7 @@ under the relevant phase as evidence.
 - [x] 2. K1 page faults (prefill over-read, decode page ids, K1 4 GiB / i32)
 - [x] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
 - [x] 4. Score-matrix scope, benches, and stronger K1 assertions
-- [ ] 5. Behavior-preserving kernel cleanup
+- [x] 5. Behavior-preserving kernel cleanup
 - [ ] 6. QSA AOT registration
 - [ ] 7. Optional: caller-owned K2 split workspace, only if a profile says so
 
@@ -439,11 +439,17 @@ comment-only, re-time the touched kernel and revert on a loss.
       times on GPU 6, cold cache: M=1 L=32768
       12.25 → 12.25 µs, M=8 18.47 → 18.34 µs, M=512 L=8192
       264.17 → 262.45 µs. Flat.
-- [ ] **5c. Emit's unused arguments.** The emit kernel takes `q`,
-      `k_cache`, `page_table`, and `score_scale` and does not read
-      them (`k1.py` ~69). Drop them from the kernel if the launch ABI
-      can change without a second compiled entry, or stop threading
-      them through. Do not change the ids the emit writes.
+- [x] **5c. Emit's unused arguments.** The emit kernel took `q`,
+      `k_cache`, `page_table`, and `score_scale` and never read them.
+      Those parameters are gone from the kernel and from its launch.
+      The plan key is still one entry per page size, so this does not
+      add a second compile. `qsa_k1_block_ids` still accepts them: the
+      long-row scorer reads them, and the emit body still writes
+      `tid` or `-1`. Family A short decode, which is the emit path,
+      still matches the oracle.
+      The K1 bar shapes have more than 512 columns, so they run the
+      scorer. The emit ceiling (`n_columns=512`, L=2048) on GPU 6,
+      cold cache: M=1 2.04 → 1.57 µs, M=8 3.08 → 2.85 µs. Not a loss.
 
 ### 6. QSA AOT registration
 
