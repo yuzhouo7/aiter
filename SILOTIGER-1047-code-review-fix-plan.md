@@ -39,7 +39,7 @@ under the relevant phase as evidence.
 - [x] 3. K1 gfx942 H=8 LDS and the runtime arch allowlist
 - [x] 4. Score-matrix scope, benches, and stronger K1 assertions
 - [x] 5. Behavior-preserving kernel cleanup
-- [ ] 6. QSA AOT registration
+- [x] 6. QSA AOT registration
 - [ ] 7. Optional: caller-owned K2 split workspace, only if a profile says so
 
 ## Locked decisions
@@ -473,8 +473,14 @@ configs"; use `default_jobs()`, the same pattern as `mega_moe.py`.
       unfixed collector with `QSA is not an AOT kind` and passes after.
       It checks the job list the collector returns. No kernel change,
       so the bar shapes were not re-timed.
-- [ ] **6b.** A collector unit check: an empty config list is an empty
+- [x] **6b.** A collector unit check: an empty config list is an empty
       job list, not a `[None]` sentinel. No GPU required.
+      `default_jobs(())` already returned `[]`. The collector was not
+      changed, and `[None]` was not added.
+      `test_qsa_aot_empty_launch_list_has_no_jobs` calls that function
+      and checks the list it returns. It passes. One launch still
+      collects one job. No kernel change, so the bar shapes were not
+      re-timed.
 
 ### 7. Optional split workspace
 
